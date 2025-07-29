@@ -1,0 +1,530 @@
+---
+title: "Are customer facilities and accessibility features linked to passenger volume at Sydney's train stations?"
+date: "`r Sys.Date()`"
+author: "Darsh Parmar(SID:530266967) & Prachet Singh(SID:530779009)"
+format: 
+  html: 
+    embed-resources: true 
+    code-fold: true
+    code-tools: true 
+    theme: united
+table-of-contents: true
+number-sections: true
+execute: 
+  message: false
+  warning: false
+---
+
+## Executive Summary
+
+Sydney's train network moves up to *one million passengers* daily. In an increasingly high-paced environment and a complex travel network, customer-experience demands substantial care and attention. This report aims to analyse and investigate the **relationship** between **various facilities and accessibility features** present at Sydney's train stations and **the cumulative passenger footfall** between Aug 2024 and May 2025.
+
+The specific **facilities** that are considered include *Commuter car park, Emergency help point, No Opal card top up or single trip ticket sales, Wheelchair accessible car space, Kiss and ride stopping area, Bike racks, Information point, Payphone, Toilets, Wheelchair accessible toilet, Baby change table, Opal card top up or single trip ticket machine (Card Payment only), Next service display, Opal card top up or single trip ticket machine (Cash or Card Payment), Taxi rank, Bike lockers, Transport Park & Ride, Bike shed, Wheelchair accessible toilet (MLAK), Opal card top up machine (Card Payment only), Free mobile phone charging, Luggage storage, and Wheelchair accessible payphone.*
+
+The specific **accessibility features** include *Independent Access, Wheelchair ramp boarding assistance, Hearing loop, PA system for announcements, Platform edge tactiles, Stairs, Level crossing, Lift, This location is Assisted Access, This location is Not Accessible, Escalator, Stair lift, Hearing loop (ticket counter), Hearing loop (concourse only), and Ramp gradient.*
+
+After calculating a "convenience score" and a "traffic score" for each train station, **a strong correlation** was observed between these 2 variables, with a **correlation coefficient of 0.808.**
+
+To further investigate this relationship, multiple regression was performed to search for the individual facilities and accessibility features that were linked to passenger footfall.
+
+The following facilities and accessibility features were found important from multiple regression:
+
+*No opal card top up or single trip ticket sale, Lift, Opal card top up machine (Card payment only) , Payphone, Next service display, Escalator, Hearing Loop, Emergency help point, Platform edge tactiles, This location is not accessible, Bike racks, sheds, lockers, Taxi rank, Community car park, and Toilet.*
+
+## Data cleaning and wrangling
+
+For this analysis, two separate data sets are combined. The first one is the *Monthly Train Station Entries and Exits* data-set, which is obtained from <https://opendata.transport.nsw.gov.au/data/dataset/train-station-entries-and-exits-data>; The second data-set is Public Transport - Location Facilities and Operators; which is obtained from <https://opendata.transport.nsw.gov.au/data/dataset/public-transport-location-facilities-and-operators>.
+
+For trip counts in the first data-set, values that were originally "Less than 50" have been converted to 25, since this is the average of 0 and 50.
+
+To quantify customer convenience, a "convenience score" was developed, which counts the number of unique facilities and accessibility features present at each station. If a station mentions that "This location is Not Accessible", then one negative point is added to its score. Finally, this number is standardised using z-score normalisation.
+
+Aggretate public volume on each station is calculated by finding the sum of each station's traffic from August 2024 to May 2025. This number is then log10-transformed to ensure that it follows a linear pattern. Finally, the resultant number is standardised using z-score normalisation.
+
+```{r}
+library(tidyverse)
+library(stringr)
+library(leaflet)
+library(scales)
+library(dplyr)
+library(olsrr)
+library(patchwork)
+library(equatiomatic)
+library(latex2exp)
+library(DT)
+library(reactable)
+
+# setting a seed for reproducibility
+set.seed(4)
+
+# import entries and exits data
+ee = read.csv("TrainStationEntriesExits/train-station-entries-exits-data-may-2025.csv")
+
+
+# clean entries and exits data
+ee_clean = ee |>
+  janitor::clean_names() |>
+  mutate(trip = as.numeric(ifelse(trip == "Less than 50", 25, trip))) |>
+  group_by(station, station_type) |>
+  summarise(traffic = sum(trip), .groups = "drop") |>
+  mutate(traffic_score = as.numeric(scale(log2(as.numeric(traffic)))),
+         station = gsub("  ", " ", station))
+
+
+# import location facility data
+lf = read.csv("locationfacilitydata.csv", header = TRUE)
+
+# clean location facility data
+lf_clean = lf |>
+  janitor::clean_names() |>
+  select(location_name, latitude, longitude, facilities, accessibility) |>
+  filter(str_detect(location_name, "Station") & !str_detect(location_name, "Bus"))|>
+  mutate(convenience_score = str_count(facilities, "\\|") +
+           ifelse(str_count(facilities, "\\|") > 0, 1, 0) +
+           str_count(accessibility, "\\|") +
+           ifelse(str_count(accessibility, "\\|"), 1, 0) +
+           ifelse(accessibility=="This location is Not Accessible |", -3, 0)) |>
+  mutate(convenience_score = as.numeric(scale(convenience_score)))
+```
+
+## Exploratory Data Analysis
+
+```{r}
+
+# merge ee_clean and lf_clean
+df = inner_join(ee_clean, lf_clean, by = c("station" = "location_name"))
+df$station_type <- tools::toTitleCase(df$station_type)
+df |> ggplot() +
+  aes(x = convenience_score, y = traffic_score,
+      colour = station_type) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(
+    title = "Convenience vs Traffic by Station Type",
+    y = "Traffic Score",
+    x = "Convenience Score",
+    color = "Station Type"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The scatterplot above indicates a strong positive correlation between the Convenience Score and Traffic Score.
+
+This motivates a Pearson's correlation coefficient test, which is performed in the next section.
+
+### Investigating Outliers
+
+Before performing the correlation test, the following outliers are examined and excluded since they would interfere with the linearity assumption for the hypothesis test. The four rows below correspond to the orange dots in the upper left corner of the previous plot. The key insight here is that all of these observations are metro station. This requires immediate attention from government authorities, since most of these stations lie in highly populated and busy areas.
+
+```{r}
+
+# finding the outliers
+df |> filter(convenience_score < -1 & traffic_score > 0.5)
+```
+
+### Testing the correlation between Convenience and Traffic
+
+Both variables satisfy linearity. Normality is checked in the *Q-Q plot* below, which indicates that most points are reasonably close to the diagonal line.
+
+```{r}
+
+# ONLY RUN THIS LINE ONCE
+df = df |> filter(!(convenience_score < -1 & traffic_score > 0.5))
+
+
+# qqplots
+qq1 = ggplot(df, aes(sample = convenience_score)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  theme_minimal() +
+  labs(title = "Normal Q-Q Plot - Convenience",
+       x = "Theoretical Quantiles",
+       y = "Observed Sample Quantiles")
+
+qq2 = ggplot(df, aes(sample = traffic_score)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  theme_minimal() +
+  labs(title = "Normal Q-Q Plot - Traffic",
+       x = "Theoretical Quantiles",
+       y = "Observed Sample Quantiles")
+
+qq1 + qq2
+```
+
+Homoscedasticity is satisfied by observing an even spread of points above and below the horizontal linen in the *Residuals vs Fitted* plot.
+
+```{r}
+
+# checking homoscedasticity
+assumption_model <- lm(convenience_score ~ traffic_score, data = df)
+ggplot(data.frame(
+  fitted = fitted(assumption_model),
+  residuals = residuals(assumption_model)),
+  aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(
+    title = "Residuals vs Fitted (Check Homoscedasticity)",
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+
+#### Pearson's Correlation Test
+
+The Pearson's correlation coefficient test results in a statistically significant p-value \< 2.2 e-16. The correlation coefficient is 0.808. Both of these results reinforce the conclusion that there exists a strong correlation between Convenience Score and Traffic Score.
+
+```{r}
+cor.test(df$convenience_score, df$traffic_score, method = "pearson")
+```
+
+## Sydney's Train Stations
+
+The following map illustrates the various aspects of this analysis. Each point represents a train station. The size of each point represents theTraffic Score; larger dots have a greater traffic score. The colour of each point represents the Convenience Score; more convenient stations have a shade that is closer to *blue* than to *red*.
+
+Note: Hovering your cursor over the stations will provide more detailed information about each station's scores. The map can be zoomed in and moved around in all directions.
+
+```{r}
+
+stations_merged <- lf_clean |>
+  inner_join(df |> select(station, traffic_score, convenience_score),
+             by = c("location_name" = "station"))
+
+
+pal <- colorNumeric(
+  palette = c("red", "navyblue"),
+  domain = stations_merged$convenience_score.y
+)
+
+leaflet(data = stations_merged) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lng = ~longitude,
+    lat = ~latitude,
+    radius = ~traffic_score * 4 + 6,  #
+    color = ~pal(convenience_score.y),
+    fillOpacity = 0.85,
+    stroke = FALSE,
+    label = ~paste0(
+  location_name, " | ",
+  "Scaled Traffic: ", round(traffic_score, 2), " | ",
+  "Convenience Score: ", round(convenience_score.y, 2)
+)
+
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = pal,
+    values = ~convenience_score.y,
+    title = "Convenience Score",
+    opacity = 1
+  ) %>%
+  setView(lng = 151.2, lat = -33.9, zoom = 11)
+```
+
+## Multiple Regression
+
+To further investigate each individual facility and accessibility feature's relationship with the traffic score, multiple regression is performed. To find the most useful multiple regression models, 4 different types of **step-wise selection techniques** are performed: *forward selection with AIC, forward selection with p-value, backward selection with AIC, and backward selection with p-value.*
+
+```{r}
+
+# step 6: add binary columns for multiple regression predictors
+df = df |>
+  mutate(ccp = ifelse(str_detect(facilities, "Commuter car park"), 1, 0),
+         ehp = ifelse(str_detect(facilities, "Emergency help point"  ), 1, 0),
+         noop = ifelse(str_detect(facilities, "No Opal card top up"), 1, 0),
+         wacs = ifelse(str_detect(facilities, "Wheelchair accessible car"), 1, 0),
+         knr = ifelse(str_detect(facilities, "Kiss and ride"), 1, 0),
+         bike = ifelse(str_detect(facilities, "Bike"), 1, 0),
+         ip = ifelse(str_detect(facilities, "Information point"), 1, 0),
+         pp = ifelse(str_detect(facilities, "Payphone"), 1, 0),
+         toi = ifelse(str_detect(facilities, "Toilets"), 1, 0),
+         wat = ifelse(str_detect(facilities, "Wheelchair accessible toilet"), 1, 0),
+         bct = ifelse(str_detect(facilities, "Baby change table"), 1, 0),
+         nsd = ifelse(str_detect(facilities, "Next service display"), 1, 0),
+         tr = ifelse(str_detect(facilities, "Taxi rank"), 1, 0),
+         tpnr = ifelse(str_detect(facilities, "Transport Park&Ride"), 1, 0),
+         opc = ifelse(
+           str_detect(facilities, "machine \\(Card Payment only\\)"), 1, 0),
+         opcc = ifelse(
+           str_detect(facilities, "machine \\(Cash or Card Payment\\)"), 1, 0),
+         optu = ifelse(str_detect(facilities, "top up machine"), 1, 0),
+         ia = ifelse(str_detect(accessibility, "Independent Access"), 1, 0),
+         wrba = ifelse(
+           str_detect(accessibility, "Wheelchair ramp boarding assistance"), 1, 0),
+         hl = ifelse(str_detect(accessibility, "Hearing loop"), 1, 0),
+         pet = ifelse(str_detect(accessibility, "Platform edge tactiles"), 1, 0),
+         stai= ifelse(str_detect(accessibility, "Stairs"), 1, 0),
+         lc = ifelse(str_detect(accessibility, "Level crossing"), 1, 0),
+         li = ifelse(str_detect(accessibility, "Lift"), 1, 0),
+         aa = ifelse(
+           str_detect(accessibility, "This location is Assisted Access"), 1, 0),
+         na = ifelse(
+           str_detect(accessibility, "This location is Not Accessible"), 1, 0),
+         ls =  ifelse(str_detect(accessibility, "Luggage storage"), 1, 0),
+         wap = ifelse(
+           str_detect(accessibility, "Wheelchair accessible payphone"), 1, 0),
+         rg = ifelse(str_detect(accessibility, "Ramp gradient"), 1, 0),
+         fmc = ifelse(
+           str_detect(accessibility, "Free mobile phone charging"), 1, 0),
+         esc = ifelse(str_detect(accessibility, "Escalator"), 1, 0),
+         sl  = ifelse(str_detect(accessibility, "Stair lift"), 1, 0)
+         )
+      
+
+# Commuter car park - ccp
+# Emergency help point - ehp
+# No Opal card top up or single trip ticket sales - noop
+# Wheelchair accessible car space, Kiss and ride stopping area -wacs
+# Bike racks -bike
+# Information point -ip
+# Payphone -pp
+# Toilets - toi
+# Wheelchair accessible toilet - wat
+# Baby change table - bct
+# Opal card top up or single trip ticket machine (Card Payment only) - opc
+# Next service display - nsd
+# Opal card top up or single trip ticket machine (Cash or Card Payment) - opcc
+# Taxi rank -tr
+# Bike lockers - bike
+# Transport Park & Ride tpnr
+# Bike shed - bike
+# Wheelchair accessible toilet (MLAK) - wat
+# Opal card top up machine (Card Payment only) - optu
+# Free mobile phone charging - fm
+# Luggage storage - ls
+# and Wheelchair accessible payphone - wap
+# 
+# This location is Independent Access - ia
+# Wheelchair ramp boarding assistance - wrba
+# Hearing loop - hl
+# PA system for announcements - pa
+# Platform edge tactiles - pet
+# Stairs - stai
+# Level crossing - lc
+# Lift - li
+# This location is Assisted Access - aa
+# This location is Not Accessible - na
+# Escalator - esc
+# Stair lift - sl
+# Hearing loop (ticket counter) - hl
+# Hearing loop (concourse only) - lh
+# Ramp gradient - rg
+```
+
+```{r}
+
+# performing feature selection
+# defining a function to perform stepwise feature selection using p-values
+stepwise_p = function(null_model, full_model, direction = c("backward", "forward"), alpha = 0.05) {
+  direction = match.arg(direction)
+  
+  # initializing model
+  if (direction == "backward") {
+    model = full_model
+    improving = TRUE
+    
+    while (improving) {
+      # checking p-values for dropping
+      test = drop1(model, test = "F")
+      max_p = max(test$`Pr(>F)`[-1], na.rm = TRUE) # exclude <none>
+      
+      if (max_p > alpha) {
+        var_to_drop = rownames(test)[which.max(test$`Pr(>F)`)]
+        model = update(model, paste(". ~ . -", var_to_drop))
+      } else {
+        improving = FALSE
+      }
+    }
+  } else if (direction == "forward") {
+    model = null_model
+    improving = TRUE
+    
+    while (improving) {
+      # checking p-values for adding
+      test = add1(model, scope = formula(full_model), test = "F")
+      min_p = min(test$`Pr(>F)`[-1], na.rm = TRUE) # exclude <none>
+      
+      if (min_p < alpha) {
+        var_to_add = rownames(test)[which.min(test$`Pr(>F)`)]
+        model = update(model, paste(". ~ . +", var_to_add))
+      } else {
+        improving = FALSE
+      }
+    }
+  }
+  return(model)
+}
+
+
+# making a new dataframe for multiple regression
+df_2 = df |> select(-c(station, station_type, traffic, facilities,
+                       accessibility, convenience_score, latitude, longitude))
+
+# no predictors
+null_model = lm(traffic_score ~ 1, data = df_2)
+# all possible predictors
+full_model = lm(traffic_score ~ ., data = df_2)
+
+
+# backward stepwise search with aic
+step_backward_aic = step(full_model,
+                     direction = "backward",
+                     trace = FALSE)
+
+# forward stepwise search with aic
+step_forward_aic = step(null_model,
+                        scope = list(lower = null_model, upper = full_model),
+                        direction = "forward", trace = FALSE)
+
+# backward stepwise search with p-value
+step_backward_p = stepwise_p(null_model, full_model, "backward")
+
+
+# forward stepwise search with p-value
+step_forward_p = stepwise_p(null_model, full_model, "forward")
+```
+
+## Out of sample performance testing
+
+The 4 resultant multiple regression models are compared using an out of performance metric *Mean Absolute Error (MAE)*. Repeated K-fold cross validation is used to obtain 50 MAE values for each model, which are then compared in the next plot.
+
+```{r}
+
+repeated_cv = function(data_frame, K = 5, repeated = 50, model_name){
+  
+  X = data_frame |> select(-traffic_score)
+  y = data_frame |> pull(traffic_score)
+  n = length(y)
+  test_id = sample(1:n, round(n * 0.25))
+  cv_mae_once = c()
+  cv_mae_repeated = c()
+  
+  for (i in 1:repeated){
+    cvSets = cvTools::cvFolds(n, K)
+    for(j in 1:K) {
+      test_id = cvSets$subsets[cvSets$which == j]
+      df_train = data_frame[-test_id, ]
+      X_test = X[test_id, ]
+      y_test = y[test_id]
+      fitted_model  = lm(formula(model_name), data = df_train)
+      y_pred = predict(fitted_model, newdata = X_test)
+      cv_mae_once = mean(abs(y_test - y_pred))
+    }
+    cv_mae_repeated = append(cv_mae_repeated, mean(cv_mae_once))
+  }
+  return(cv_mae_repeated)
+}
+
+# calculating repeated kfoldcv MAE values for each model
+
+step_forward_aic_kfcv = repeated_cv(df_2, model_name = step_forward_aic)
+
+step_backward_aic_kfcv = repeated_cv(df_2, model_name = step_backward_aic)
+
+step_forward_p_kfcv = repeated_cv(df_2, model_name = step_forward_p)
+
+step_backward_p_kfcv = repeated_cv(df_2, model_name = step_backward_p)
+
+
+
+results = data.frame(model_name = rep(c("Forward (AIC)",
+                                    "Backward (AIC)",
+                                    "Forward (P-value)",
+                                    "Backward (P-value)"),
+                                    each = 50),
+                     mae = c(step_forward_aic_kfcv,
+                             step_backward_aic_kfcv,
+                             step_forward_p_kfcv,
+                             step_backward_p_kfcv))
+results |> ggplot() +
+  aes(x = model_name, y = mae, fill = model_name) +
+  geom_boxplot() + 
+  labs(title = "Comparison of MAE for candidate models",
+       y = "Mean Absolute Error (MAE)",
+       x = "Model Selection Technique") + 
+  theme(axis.title.x = element_text(vjust = 0),
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5)) 
+```
+
+The boxplot above suggests that all 4 candidate models have similar performance on unseen data. Therefore, the final model is chosen on the basis of simplicity: the model with the fewest predictors.
+
+```{r}
+formula_length = data.frame(model =c("Forward (AIC)",
+                            "Backward (AIC)",
+                            "Forward (P-value)",
+                            "Backward (P-value)"),
+                             number_of_terms = c(
+                             length(attr(terms(step_forward_aic), "term.labels")),
+                             length(attr(terms(step_backward_aic), "term.labels")),
+                             length(attr(terms(step_forward_p), "term.labels")),
+                             length(attr(terms(step_backward_p), "term.labels"))
+                               ))
+
+reactable(formula_length)
+```
+
+The table above shows that the simplest is the one chosen using *Forward Search with P-value*.
+
+**This model contains the following predictors:**
+
+-   No opal card top up or single trip ticket sale - (noop)
+
+-   Lift - (li)
+
+-   Opal card top up machine (Card payment only) - (optu)
+
+-   Payphone - (pp)
+
+-   Next service display - (nsd)
+
+-   Escalator - (esc)
+
+-   Hearing Loop - (hl)
+
+-   Emergency help point - (ehp)
+
+-   Platform edge tactilies - (pet)
+
+-   This location is not accessible - (na)
+
+-   Bike racks, sheds, lockers - (bike)
+
+-   Taxi rank - (tr)
+
+-   Community car park - (ccp)
+
+-   Toilet - (toi)
+
+**The multiple regression model has the following equation:**
+
+```{r}
+coefs <- coef(step_forward_p)
+equation <- paste0(
+  "mpg = ", round(coefs[1], 2), " + ",
+  paste(paste0(round(coefs[-1], 2), " * ", names(coefs)[-1]), collapse = " + ")
+)
+equation
+```
+
+## Limitations
+
+The above analysis was carried out with several assumptions. The first one is *independence*. It is important to recognize that each station's data is not truly independent. Stations that are closer to the Central Business District (like Wynyard and Townhall) will naturally have similar observations. Additionally, track-work and other rail obstructions on certain train lines affect several stations simultaneously, thereby affecting independence.
+
+External factors such as suburb population, business districts, educational institutions, and recreational destinations influence the relationship between the *Convenience Score and Traffic Score*, thereby acting as **confounding variables.**
+
+Further analysis on this topic with additional data on the aforementioned limitations would improve the quality of the results.
+
+## Conclusion
+
+There is a clear relationship between passenger convenience and volume at train stations, supported by a *correlation coefficient of 0.808*. The results of multiple regression provide the most important predictors of passenger traffic.
+
+As mentioned previously, this result must be considered with a grain of salt, since the independence is not completely satisfied, and there may be several lurking variables
+
+## References
+
+**Transport for NSW** (2025) *Train station entries and exits data*. Available at: <https://opendata.transport.nsw.gov.au/data/dataset/train-station-entries-and-exits-data> (Accessed: 23 July 2025).
+
+**Transport for NSW** (2025) *Public transport location, facilities and operators*. Available at: <https://opendata.transport.nsw.gov.au/data/dataset/public-transport-location-facilities-and-operators> (Accessed: 23 July 2025).
